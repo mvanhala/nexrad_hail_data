@@ -1,0 +1,758 @@
+---
+title: "NEXRAD Hail Data"
+author: "Matthew Van Hala"
+date: "`r format(Sys.time(), '%A, %B %e, %Y')`"
+knit: (function(inputFile, encoding) { 
+        rmarkdown::render(
+          inputFile,
+          encoding = encoding, 
+          output_file = file.path(
+            rprojroot::find_rstudio_root_file(), "docs",
+            paste0(tools::file_path_sans_ext(basename(inputFile)), ".html")
+          )
+        )
+      })
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+---
+
+```{r setup, include = FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+options(scipen = 10)
+```
+
+```{r}
+library(parallel)
+library(readr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(purrr)
+library(Rcpp)
+library(rgdal)
+library(rgeos)
+library(sp)
+library(tibble)
+library(leaflet)
+library(stringr)
+library(xts)
+library(tidyr)
+library(dygraphs)
+library(DT)
+```
+
+# Data
+
+The NOAA data I found on AWS was for [NEXRAD](https://aws.amazon.com/noaa-big-data/nexrad/), containing an archive of Level II data from June 1991 to the present. The NOAA [Severe Weather Data Inventory](https://www.ncdc.noaa.gov/swdi/#Intro) contains Level III product data on hail and storms.
+
+To begin, I downloaded the NEXRAD hail signatures [data](http://www1.ncdc.noaa.gov/pub/data/swdi/database-csv/v2/). These hail csv files were downloaded and extracted to the folder `data/nexrad/hail/csv`. Then the first step is reading all of the files.
+
+```{r}
+cl <- makeCluster(4)
+invisible(clusterEvalQ(cl, { library(readr); library(dplyr); library(lubridate) }))
+ 
+hail_data <- clusterApplyLB(
+  cl, list.files("data/nexrad/hail/csv", full.names = TRUE),
+  function(path) {
+    read_csv(path, skip = 3, 
+             col_names = c("time", "lon", "lat", "wsr_id", "cell_id", "range", 
+                           "azimuth", "sevprob", "prob", "maxsize"),
+             col_types = cols(time = col_datetime(format = "%Y%m%d%H%M%S"))) %>%
+      mutate(azimuth = azimuth %% 360,
+             yr = year(time), 
+             mon = month(time))
+  }
+)
+ 
+stopCluster(cl)
+ 
+hail_full <- bind_rows(hail_data)
+```
+
+Here is a sample of a few rows from the data.
+
+<br>
+
+```{r}
+set.seed(2606)
+ 
+hail_full %>%
+  sample_n(100) %>%
+  select(-yr, -mon) %>%
+  mutate(time = as.character(time)) %>%
+  datatable(rownames = FALSE,
+            options = list(scrollX = TRUE))
+```
+
+<br>
+
+This [page](https://www.ncdc.noaa.gov/swdiws/csv/nx3hail) contains some documentation on NEXRAD Level III products. The following are definitions of the variables in the hail data set.
+
+* time: observation time (GMT)
+
+* lon: longitude
+
+* lat: latitude
+
+* wsr_id: site ID
+
+* cell_id: cell ID unique to radar site
+
+* range: distance from station (nautical miles)
+
+* azimuth: angle from station (degrees)
+
+* sevprob: probability of severe hail (percent)
+
+* prob: probabilty of hail (percent)
+
+* max_size: max size (inches)
+
+Values of `-999` appear to be missing values.
+
+
+# Station metadata
+
+```{r}
+nexrad_stations <- read_fwf(
+  "data/stations/nexrad-stations.txt", 
+  fwf_positions(start = c(1, 10, 15, 21, 52, 73, 76, 107, 117, 127, 134, 140), 
+                end = c(8, 13, 19, 50, 71, 74, 105, 115, 125, 132, 138, NA),
+                col_names = c("ncdcid", "icao", "wban", "name", "country", "state", "county", 
+                              "lat", "lon", "elevation", "tz", "station_type")), 
+  skip = 2,
+  col_types = "cccccccddddc"
+) 
+ 
+asos_stations <- read_fwf(
+  "data/stations/asos-stations.txt",
+  fwf_positions(start = c(1, 10, 16, 23, 28, 59, 90, 111, 114, 145, 155, 166, 173, 179),
+                end = c(8, 14, 21, 26, 57, 88, 109, 112, 143, 153, 164, 171, 177, NA),
+                col_names = c("ncdcid", "wban", "coopid", "call", "name", "alt_name", "country",
+                              "state", "county", "lat", "lon", "elevation", "tz", "station_type")),
+  skip = 2,
+  col_types = "cccccccccddddc"
+)
+ 
+station_cnt <- count(hail_full, wsr_id)
+ 
+non_nexrad <- station_cnt %>%
+  anti_join(nexrad_stations, by = c("wsr_id" = "icao")) %>%
+  mutate(call = str_sub(wsr_id, start = 2),
+         call = recode(call, "ICH"  = "ICT", "IDS" = "IND", "LVE" = "CLE"))
+ 
+hail_nexrad <- nexrad_stations %>% 
+  semi_join(station_cnt, by = c("icao" = "wsr_id")) %>%
+  select(wsr_id = icao, everything()) %>%
+  mutate(source = "NEXRAD")
+ 
+hail_asos <- asos_stations %>%
+  inner_join(non_nexrad, by = "call") %>%
+  select(wsr_id, ncdcid, wban, name, country, state, county, lat, lon, elevation, tz, station_type) %>%
+  mutate(source = "TDWR")
+ 
+andrews_afb <- tibble(wsr_id = "KADW", ncdcid = "20009472", wban = "13705", 
+                      name = "CAMP SPRINGS ANDREWS AFB", country = "UNITED STATES", state = "MD",
+                      county = "PRINCE GEORGE'S", lat = 38.81667, lon = -76.86667, elevation = 282, 
+                      tz = -5, station_type = NA_character_, source = "OTHER")
+ 
+all_stations <- bind_rows(hail_nexrad, hail_asos, andrews_afb)
+```
+
+The hail data contains observations from both NEXRAD stations and Terminal Doppler Weather Radar (TDWR) stations.
+
+Here are the observation counts for the `r nrow(station_cnt)` stations appearining in the data.
+
+<br>
+
+```{r}
+datatable(station_cnt,
+          rownames = FALSE,
+          colnames = c("Observations" = "n"),
+          options = list(scrollX = TRUE,
+                         pageLength = 5,
+                         dom = "lipt")) %>%
+  formatCurrency("Observations", currency = "", digits = 0)
+```
+
+<br>
+
+From the [Historical Observing Metadata Repository](http://www.ncdc.noaa.gov/homr/), I downloaded metadata on the NEXRAD stations. There are `r nrow(nexrad_stations)` NEXRAD stations. For a handful of stations, shown in the following table, there existed no observations in the hail data.
+
+<br>
+
+```{r}
+nexrad_stations %>% 
+  anti_join(station_cnt, by = c("icao" = "wsr_id")) %>%
+  datatable(class = "cell-border",
+            rownames = FALSE,
+            options = list(scrollX = TRUE, 
+                           ordering = FALSE,
+                           autoWidth = TRUE,
+                           dom = "t",
+                           pageLength = nrow(.)))
+```
+
+<br>
+
+For `r nrow(hail_asos)` TDWR stations, which are located at airports, I found metadata information from the Automated Surface Observing System (ASOS) station list at the Historical Observing Metadata Repository.
+
+For three stations, shown in the following table, the call sign (which I used to join the ASOS stations to the hail stations) differed from the last three letters of the `wsr_id` value.
+
+<br>
+
+```{r}
+tribble(~city, ~wsr_id, ~call,
+        "Wichita", "KICH", "ICT",
+        "Indianapolis", "KIDS", "IND",
+        "Cleveland", "KLVE", "CLE")
+```
+
+<br>
+
+I presume the `wsr_id` for these stations differed because there already existed NEXRAD stations with these values (KICT, KIND, KCLE). A [note released](http://www.nws.noaa.gov/os/notification/tin08-85_tdwr_spg.txt) in 2008 when NOAA began disseminating TDWR radar products seems to confirm that these call signs and id values correspond with each other.
+
+In addition to the `r nrow(hail_nexrad)` NEXRAD stations and `r nrow(hail_asos)` TDWR stations, there was one additional station with observations in the hail data that was neither in the NEXRAD or ASOS list: KADW at [Andrews AFB](http://www.ncdc.noaa.gov/homr/#ncdcstnid=20009472&tab=MSHR).
+
+Here is a table of metadata for all `r nrow(all_stations)` stations with observations in the hail data.
+
+<br>
+
+```{r}
+all_stations %>%
+  datatable(rownames = FALSE,
+            options = list(scrollX = TRUE))
+```
+
+<br>
+
+
+# Basic data exploration
+
+```{r}
+azimuth_cnt <- hail_full %>%
+  count(azimuth)
+ 
+range_cnt <- hail_full %>%
+  count(range)
+```
+
+I downloaded the hail csv files from 1995 to 2015. There are a total of `r prettyNum(nrow(hail_full), big.mark = ",")` observations in the data.
+
+## Azimuth frequency
+
+Here is a frequency polygon of `azimuth` in the data.
+
+```{r}
+ggplot(azimuth_cnt) + 
+  geom_freqpoly(aes(x = azimuth, y = n), stat = "identity") +
+  expand_limits(y = 0) + 
+  theme_minimal() +
+  theme(axis.title.y = element_blank())
+```
+
+
+## Range frequency
+
+Here is a frequency polygon for the `range` variable.
+
+```{r}
+ggplot(range_cnt) + 
+  geom_freqpoly(aes(x = range, y = n), stat = "identity") +
+  expand_limits(y = 0) + 
+  theme_minimal() +
+  theme(axis.title.y = element_blank())
+```
+
+We see that the overwhelming majority of ranges are less than, say, 250 nautical miles. However, there are a handful of seemingly extreme outliers. The maximum value of `range` is `r prettyNum(max(range_cnt[["range"]]), big.mark = ",")`, and there are `r prettyNum(sum(filter(range_cnt, range > 250)[["n"]]), big.mark = ",")` observations with `range` greater than 250. Here is a plot of the frequency when we exclude ranges greater than 250.
+
+```{r}
+ggplot(range_cnt %>%
+         filter(range <= 250)) + 
+  geom_freqpoly(aes(x = range, y = n), stat = "identity") +
+  expand_limits(y = 0) + 
+  theme_minimal() +
+  theme(axis.title.y = element_blank())
+```
+
+The pattern is generally what we would expect, with an increase in frequency as range increases, as there is more available area for observations, then a decrease as range continues to increase beyond a certain point, as it starts to become less likely for the storm to be detected by the radar station.
+
+There are a couple of peculiar blips in the data, such as the large spike at around 110 nautical miles.
+
+```{r}
+range_cnt_by_source <- hail_full %>% 
+  select(wsr_id, range) %>%
+  left_join(all_stations %>%
+              select(wsr_id, source),
+            by = "wsr_id") %>%
+  count(source, range) %>%
+  ungroup
+ 
+azimuth_cnt_by_source <- hail_full %>% 
+  select(wsr_id, azimuth) %>%
+  left_join(all_stations %>%
+              select(wsr_id, source),
+            by = "wsr_id") %>%
+  count(source, azimuth) %>%
+  ungroup
+```
+
+Let's take a look at the distribution of range for NEXRAD vs. TDWR stations. Once again, we'll filter to range of less than or equal to 250 nautical miles.
+
+```{r, fig.width = 9}
+ggplot(range_cnt_by_source %>% 
+         filter(source %in% c("NEXRAD", "TDWR"), range <= 250) %>% 
+         group_by(source) %>% 
+         mutate(rel_freq = n / sum(n)) %>% 
+         ungroup) + 
+  geom_freqpoly(aes(x = range, y = rel_freq), stat = "identity") +
+  facet_wrap(~ source, ncol = 2) +
+  expand_limits(y = 0) + 
+  theme_minimal() +
+  theme(axis.title = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank())
+```
+
+We can see that the TDWR stations have a much more limited range than the NEXRAD stations, with the NEXRAD range appearing to fall off a cliff at around 50 nautical miles.
+
+## Frequency over time
+
+```{r}
+month_cnt <- hail_full %>% 
+  count(wsr_id, yr, mon) %>% 
+  ungroup %>%
+  mutate(yrmon = as.yearmon(paste(yr, str_pad(mon, width = 2, side = "left", pad = "0"), sep = "-")))
+```
+
+The following chart shows the number of observations by month for the duration of the data set.
+
+<br>
+
+```{r, fig.width = 11}
+month_cnt %>% 
+  group_by(yrmon) %>% 
+  tally(n) %>%
+  { xts(select(., nn), order.by = .[["yrmon"]]) } %>%
+  dygraph %>%
+  dyOptions(maxNumberWidth = 20) %>%
+  dySeries("nn", label = "Observations") %>%
+  dyAxis("y", pixelsPerLabel = 100,
+         valueFormatter = 'function(d){return d.toString().replace(/\\B(?=(\\d{3})+(?!\\d))/g, ",");}',
+         axisLabelFormatter = 'function(d){return d.toString().replace(/\\B(?=(\\d{3})+(?!\\d))/g, ",");}',
+         axisLabelWidth = 70)
+```
+
+<br>
+
+We see an increase in th early to mid 2000s, perhaps as more stations became active. We also notice the number of observations was quite depressed in 2002.
+
+Here is a chart of the breakdown in observation counts between NEXRAD and TDWR stations.
+
+<br>
+
+```{r, fig.width = 11}
+month_cnt %>% 
+  left_join(select(all_stations, wsr_id, source), by = "wsr_id") %>%
+  group_by(source, yrmon) %>% 
+  tally(n) %>%
+  ungroup %>%
+  spread(source, nn) %>%
+  { xts(select(., NEXRAD, TDWR), order.by = .[["yrmon"]]) } %>%
+  dygraph %>%
+  dyOptions(maxNumberWidth = 20) %>%
+  dyAxis("y", pixelsPerLabel = 100,
+         valueFormatter = 'function(d){return d.toString().replace(/\\B(?=(\\d{3})+(?!\\d))/g, ",");}',
+         axisLabelFormatter = 'function(d){return d.toString().replace(/\\B(?=(\\d{3})+(?!\\d))/g, ",");}',
+         axisLabelWidth = 70)
+```
+
+<br>
+
+There were a small number of observations at TDWR stations in the 1990s, then none until NOAA began disseminating TDWR radar products. Even though there are a quarter as many TDWR stations as NEXRAD stations, the number of TDWR observations is far less than a quarter of the number of NEXRAD observations. Perhaps this is a result of the TDWR range being smaller than that of NEXRAD.
+
+# Station locations maps
+
+Here is a map of the locations of the stations in the data.
+
+<br>
+
+```{r, fig.width = 11, fig.height = 7}
+leaflet() %>% 
+  addProviderTiles("Stamen.TonerLite") %>% 
+  addCircleMarkers(data = all_stations %>%
+                     filter(state %in% state.abb, source == "NEXRAD"), 
+                     lat = ~lat, lng = ~lon, label = ~name, group = "NEXRAD",
+                   color = "purple", fillColor = "purple", radius = 6) %>%
+  addCircleMarkers(data = all_stations %>%
+                     filter(state %in% state.abb, source == "TDWR"), 
+                   lat = ~lat, lng = ~lon, label = ~name, group = "TDWR", 
+                   color = "green", fillColor = "green", radius = 6) %>%
+  addCircleMarkers(data = all_stations %>%
+                       filter(state %in% state.abb, source == "OTHER"), 
+                     lat = ~lat, lng = ~lon, label = ~name, group = "OTHER", 
+                   color = "orange", fillColor = "orange", radius = 6) %>%
+  addLayersControl(
+    overlayGroups = c("NEXRAD", "TDWR", "OTHER"),
+    options = layersControlOptions(collapsed = FALSE)
+  )
+```
+
+<br>
+
+## Observations far from stations
+
+Earlier we noted a handful of seeming outlier observations that were several hundred miles away from the station. Let's take a look at this for a couple of stations.
+
+### Omaha
+
+The following map shows the location of the Omaha station, the convex hull of observations within 250 nautical miles of Omaha, and the locations of all points from the Omaha station greater than 250 nautical miles away. When you hover over a point, you see the time at which the observation occurred.
+
+It may be notable that all of them appear to have occurred in the late 1990s and early 2000s.
+
+```{r}
+omaha_points <- hail_full %>% 
+  filter(wsr_id == "KOAX") 
+ 
+omaha_hull <- omaha_points %>%
+  filter(range <= 250) %>%
+  select(lon, lat) %>%
+  SpatialPoints %>%
+  gConvexHull
+ 
+omaha_far <- omaha_points %>% 
+  filter(range > 250) %>%
+  select(lon, lat, time) %>%
+  mutate(time = as.character(time)) %>%
+  SpatialPointsDataFrame(coords = select(., lon, lat), data = .)
+```
+
+```{r, fig.width = 11}
+leaflet() %>% 
+  addProviderTiles("CartoDB.Positron") %>% 
+  addPolygons(data = omaha_hull, fillOpacity = 0.2, weight = 1) %>%
+  addCircleMarkers(data = omaha_far, color = "red", fillColor = "red", label = ~time) %>%
+  addCircleMarkers(data = all_stations %>% 
+                     filter(wsr_id == "KOAX") %>% 
+                     SpatialPointsDataFrame(coords = select(., lon, lat), data = .),
+                   color = "green", fillColor = "green", label = ~name)
+```
+
+
+### Jacksonville
+
+```{r}
+jax_points <- hail_full %>% 
+  filter(wsr_id == "KJAX") 
+ 
+jax_hull <- jax_points %>%
+  filter(range <= 250) %>%
+  select(lon, lat) %>%
+  SpatialPoints %>%
+  gConvexHull
+ 
+jax_far <- jax_points %>% 
+  filter(range > 250) %>%
+  select(lon, lat, time) %>%
+  mutate(time = as.character(time)) %>%
+  SpatialPointsDataFrame(coords = select(., lon, lat), data = .)
+```
+
+The following map shows the same for Jacksonville as for Omaha above. Again, we note that all of the far outlying observations occurred in the late 1990s and early 2000s.
+
+<br>
+
+```{r, fig.width = 11}
+leaflet() %>% 
+  addProviderTiles("CartoDB.Positron") %>% 
+  addPolygons(data = jax_hull, fillOpacity = 0.2, weight = 1) %>%
+  addCircleMarkers(data = jax_far, color = "red", fillColor = "red", label = ~time) %>%
+  addCircleMarkers(data = all_stations %>% 
+                     filter(wsr_id == "KJAX") %>% 
+                     SpatialPointsDataFrame(coords = select(., lon, lat), data = .),
+                   color = "green", fillColor = "green", label = ~name)
+```
+
+<br>
+
+
+## Grid of observation points
+
+Also of note is that it looks like points can only occur only a grid determined by the azimuth and range. This becomes clear to see when we zoom in on some points. Here is a sample of points from Des Moines with a range from 150 to 200 and azimuth of 75 to 105. We can see points only occur on a grid.
+
+```{r}
+dsm_points <- hail_full %>%
+  filter(wsr_id == "KDMX")
+ 
+set.seed(2642)
+dsm_grid <- dsm_points %>%
+  filter(range <= 200, range > 150, azimuth >= 75, azimuth <= 105) %>%
+  sample_n(5000)
+ 
+dsm_close <- dsm_points %>%
+  filter(range < 10)
+```
+
+<br>
+
+```{r, fig.width = 11}
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addCircles(data = dsm_grid, lat = ~lat, lng = ~lon, radius = 2) %>%
+  setView(lat = 41.7, lng = -90, zoom = 8)
+```
+
+<br>
+
+It also is clear to see when we look at the following map of points less than 10 nautical miles from Des Moines.
+
+<br>
+
+```{r fig.width = 11}
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addCircles(data = dsm_close, lat = ~lat, lng = ~lon, radius = 2) %>%
+  setView(lat = 41.73, lng = -93.72, zoom = 11)
+```
+
+<br>
+
+## Convex hulls of observations
+
+The following map shows the convex hull of observations at each station (of observations with range less than or equal to 250 nautical miles, filtering out the seeming outliers). It visually drives home the point about how the range of the TDWR stations is much less than the NEXRAD stations. We also notice the considerable overlap in coverage across the country. This varies by region, with not as dense overlap in the mountain West and the heaviest overlap in the Midwest and South, but it exists across the country.
+
+```{r}
+station_point_df <- hail_full %>%
+  group_by(wsr_id) %>%
+  by_slice(~ select(., lon, lat, range), .to = "pts")
+ 
+cl <- makeCluster(24)
+invisible(clusterEvalQ(cl, { library(sp); library(dplyr); library(rgeos) }))
+ 
+station_point_df$chull <- parLapply(cl, station_point_df[["pts"]], function(pts) {
+  pts %>%
+    filter(range <= 250) %>%
+    select(lon, lat) %>%
+    SpatialPoints(proj4string = CRS("+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0")) %>%
+    gConvexHull
+})
+ 
+stopCluster(cl)
+ 
+set.seed(25987)
+station_colors <- all_stations %>% 
+  select(wsr_id, source, name, lon, lat) %>%
+  mutate(color = map_chr(
+    source, 
+    function(source) {
+      if (source != "TDWR") color <- sample(c("red", "green", "blue", "purple", "brown"), 1)
+      else color <- "black"
+      color
+    }
+  ))
+ 
+station_hulls <- station_point_df %>%
+  left_join(station_colors, by = "wsr_id") %>%
+  mutate(rownum = 1:nrow(.),
+         hull_poly = pmap(
+           list(chull, wsr_id, rownum, color, source), 
+           function(hull, wsr_id, rownum, color, source) {
+             hull@polygons[[1]]@ID <- as.character(rownum)
+             df <- data_frame(wsr_id) %>%
+               mutate(color = color, 
+                      source = source)
+             suppressWarnings({ rownames(df) <- rownum })
+             SpatialPolygonsDataFrame(hull, df)
+           }
+         )
+  )
+ 
+station_hulls_combined <- lift_dl(sp::rbind.SpatialPolygonsDataFrame)(c(station_hulls$hull_poly))
+```
+
+
+<br>
+
+```{r, fig.width = 11}
+leaflet() %>% 
+  addProviderTiles("Stamen.TonerLite") %>% 
+  addPolygons(data = station_hulls_combined[station_hulls_combined$source == "NEXRAD", ], group = "NEXRAD", 
+              weight = 2, color = ~color, fillColor = ~color, fillOpacity = 0.05) %>%
+  addPolygons(data = station_hulls_combined[station_hulls_combined$source == "OTHER", ], group = "OTHER", 
+              weight = 2, color = ~color, fillColor = ~color, fillOpacity = 0.05) %>%
+  addPolygons(data = station_hulls_combined[station_hulls_combined$source == "TDWR", ], group = "TDWR", 
+              weight = 2, color = ~color, fillColor = ~color, fillOpacity = 0.35) %>%
+  addLayersControl(
+    overlayGroups = c("NEXRAD", "TDWR", "OTHER"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) %>%
+  setView(lng = -98, lat = 37, zoom = 4)
+```
+
+<br>
+
+The following map reinforces the point about overlap in coverage. Shown on this map are stations for which the convex hull of their observations covers Des Moines. We observe that there are twelve stations whose convex hulls cover Des Moines, from Minneapolis to St. Louis.
+
+```{r}
+dsm_hulls <- station_hulls_combined[
+  as.logical(
+    gIntersects(
+      SpatialPoints(matrix(c(-93.72278, 41.73111), ncol = 2),
+                    proj4string = CRS("+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0")), 
+      station_hulls_combined, byid = TRUE)
+  ), ]
+```
+
+<br>
+
+```{r, fig.width = 11}
+leaflet() %>% 
+  addProviderTiles("Stamen.TonerLite") %>% 
+  addPolygons(data = dsm_hulls,
+              weight = 2, color = ~color, fillColor = ~color, fillOpacity = 0.05) %>%
+  addCircleMarkers(data = semi_join(station_colors, dsm_hulls@data, by = "wsr_id"),
+                   lat = ~lat, lng = ~lon, color = ~color, fillColor = ~color,
+                   label = ~name)
+```
+
+<br>
+
+
+# Frequency of hail storm events in Illinois
+
+As an initial look at the geographic of hail storm events in the NEXRAD, I looked at computing some basic observation counts in Illinois. Splitting the state of Illinois into a hexagonal grid, I computed the number of events in each bin. 
+
+To try to account for the widespread overlap in station coverage, and consequently getting observations from many different stations for the same event, what I did was for each hex bin, count the number of three-hour intervals containing an event. 
+
+For a specific example, if there was an event at 10:15 AM, that would count an event. Then the next observation in that bin at 1:15 PM that day or later would be the next event. That is, the next observation occurring at least three hours after the current active event would be counted as the next event for that point.
+
+```{r}
+cppFunction(
+  'NumericVector time_grp_cpp(NumericVector posix_secs, double boundary = 10800) {
+    int n = posix_secs.size();
+    NumericVector time_grp = NumericVector(n);
+    time_grp[0] = 1;
+    double offset = 0;
+    for(int i = 1; i < n; i++) {
+      offset = offset + posix_secs[i] - posix_secs[i - 1];
+      if(offset > boundary) {
+        time_grp[i] = time_grp[i - 1] + 1;
+        offset = 0;
+      } else {
+        time_grp[i] = time_grp[i - 1];
+      }
+    }
+    return time_grp;
+  }'
+)
+ 
+state_shp <- readOGR("/data_shared/geospatial/shapefiles/cb_2015_us_state_20m/", 
+                     "cb_2015_us_state_20m", verbose = FALSE)
+ 
+states <- c("IL")
+ 
+state_hull <- gConvexHull(state_shp[state_shp$STUSPS %in% states, ])
+state_union <- gUnaryUnion(state_shp[state_shp$STUSPS %in% states, ])
+ 
+state_hex <- state_hull %>%
+  spsample(n = 2500, type = "hexagonal") %>%
+  HexPoints2SpatialPolygons %>%
+  `[`(as.logical(gIntersects(., state_union, byid = TRUE)), ) %>%
+  SpatialPolygonsDataFrame(data = tibble(id = map_chr(.@polygons, ~ .@ID)), match.ID = FALSE)
+ 
+state_hex_union <- gUnaryUnion(state_hex)
+ 
+cores <- 32
+ 
+hail_full_list <- hail_full %>%
+  select(lon, lat, time, wsr_id) %>%
+  split(rep(1:cores, each = ceiling(nrow(.) / cores))[1:nrow(.)])
+ 
+cl <- makeCluster(cores)
+invisible(clusterEvalQ(cl, { library(sp); library(rgeos); library(dplyr) }))
+ 
+hail_points_by_hex <- parLapply(
+  cl, hail_full_list, 
+  function(hail_pts, state_hex, state_hex_union) {
+    hail_pts_in_region <- hail_pts %>%
+      SpatialPointsDataFrame(select(., lon, lat), data = ., 
+                             proj4string = CRS(proj4string(state_hex))) %>%
+      `[`(as.logical(gIntersects(., state_hex_union, byid = TRUE)), )
+    hail_pts_in_region@data %>%
+      mutate(id = suppressWarnings(sp::over(hail_pts_in_region, state_hex))[["id"]])
+  },
+  state_hex = state_hex, state_hex_union = state_hex_union
+)
+ 
+stopCluster(cl)
+ 
+hail_points_hex_sorted <- hail_points_by_hex %>%
+  bind_rows %>%
+  arrange(id, time)
+ 
+hail_hex_cnt <- hail_points_hex_sorted %>%
+  group_by(id) %>%
+  mutate(time_grp = time_grp_cpp(as.numeric(time))) %>%
+  summarise(count = max(time_grp))
+ 
+nexrad_list <- all_stations %>%
+  filter(station_type == "NEXRAD") %>%
+  .[["wsr_id"]]
+ 
+hail_hex_cnt_nexrad <- hail_points_hex_sorted %>%
+  filter(wsr_id %in% nexrad_list) %>%
+  group_by(id) %>%
+  mutate(time_grp = time_grp_cpp(as.numeric(time))) %>%
+  summarise(count = max(time_grp))
+```
+
+
+The following shows the number of events by hex bin in the entire data for the state of Illinois.
+
+<br>
+
+```{r, fig.height = 11, fig.width = 9}
+state_hex_count <- state_hex
+state_hex_count@data <- state_hex_count@data %>%
+  left_join(hail_hex_cnt, by = "id")
+ 
+color_pal <- colorNumeric("YlOrRd", state_hex_count$count)
+ 
+leaflet(state_hex_count) %>% 
+  addProviderTiles("Stamen.TonerLite") %>% 
+  addPolygons(weight = 0.25, color = "black",
+              fillColor = ~color_pal(count), fillOpacity = 0.7)%>%
+  addLegend("bottomright", color_pal, state_hex_count$count, title = "Events", opacity = 1)
+
+```
+
+<br>
+
+We can see a couple of concentrations around St. Louis and Chicago, which are locations of TDWR stations. Recalling the differences between NEXRAD and TDWR stations, I excluded TDWR observations and re-calculated the hex bin counts. We can see a bit of a difference from the previous map. The relative concentration around St. Louis has diminished (along with the concentration around Chicago to some degree), making the concentration in far southern Illinois relative to the rest of the state more pronounced.
+
+<br>
+
+```{r, fig.height = 11, fig.width = 9}
+state_hex_count_nexrad <- state_hex
+state_hex_count_nexrad@data <- state_hex_count_nexrad@data %>%
+  left_join(hail_hex_cnt_nexrad, by = "id")
+  
+color_pal <- colorNumeric("YlOrRd", state_hex_count_nexrad$count)
+  
+leaflet(state_hex_count_nexrad) %>% 
+  addProviderTiles("Stamen.TonerLite") %>% 
+  addPolygons(weight = 0.25, color = "black",
+              fillColor = ~color_pal(count), fillOpacity = 0.7) %>%
+  addLegend("bottomright", color_pal, state_hex_count_nexrad$count, title = "Events", opacity = 1)
+```
+
+<br>
+
+
+
